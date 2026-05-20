@@ -1,9 +1,11 @@
-local goggle_link_port = peripheral.find("goggle_link_port")
+﻿local goggle_link_port = peripheral.find("goggle_link_port")
+local mwvsRadar = peripheral.find("mwvs_radar")
+local mwvsLastLockShipId = nil
 
-local system, properties, linkedCannons, scanner, rayCaster, group, MONSTERLIST
+local system, properties, scanner, rayCaster, group, MONSTERLIST
+local linkedCannons = {}
 local linkedgoggles = {}
-local modList = {"HMS", "POINT", "SHIP", "PLAYER", "MONSTER", "MOBS"}
-local protocol, missile_protocol, request_protocol = "CBCNetWork", "CBCMissileNetWork", "CBCcenter"
+local modList = {"SHIP"}
 
 local tm_monitors = {
     list = {}
@@ -12,7 +14,6 @@ local tm_monitors = {
 system = {
     propFileName = "dat",
     groupFileName = "group",
-    linkedCannons = "linkedCannons",
     monster = "monster",
 
     propFile = nil
@@ -21,8 +22,10 @@ system = {
 system.init = function()
     properties = system.datFromFile(system.propFileName)
     group = system.datFromFile(system.groupFileName)
-    linkedCannons = system.datFromFile(system.linkedCannons)
     MONSTERLIST = system.datFromFile(system.monster)
+    for _, g in pairs(group) do
+        g.mode = 1
+    end
     
     system.updatePersistentData()
 end
@@ -46,8 +49,6 @@ system.datFromFile = function (fileName)
             else
                 result = tmpFile
             end
-        elseif fileName == "linkedCannons" then
-            result = tmpFile
         elseif fileName == "monster" then
             result = tmpFile
         end
@@ -58,8 +59,6 @@ system.datFromFile = function (fileName)
             result = system.resetProp()
         elseif fileName == "group" then
             result = system.resetGroup()
-        elseif fileName == "linkedCannons" then
-            result = {}
         elseif fileName == "monster" then
             result = system.resetMonster()
         end
@@ -88,7 +87,7 @@ system.resetGroup = function ()
     for i = 1, 10, 1 do
         g[i] = {
             name = "group" .. i,
-            mode = 2,
+            mode = 1,
             pos = {
                 x = 0,
                 y = 0,
@@ -97,9 +96,6 @@ system.resetGroup = function ()
             HmsUser = nil,
             HmsMode = 1,
             radarTargets = {},
-            fire = false,
-            fireCd = 0,
-            autoFire = false,
             autoSelect = false,
         }
     end
@@ -117,7 +113,6 @@ end
 system.updatePersistentData = function()
     system.write(system.propFileName, properties)
     system.write(system.groupFileName, group)
-    system.write(system.linkedCannons, linkedCannons)
     system.write(system.monster, MONSTERLIST)
 end
 
@@ -360,42 +355,8 @@ rayCaster.run = function(start, v3Speed, range, showParticle)
     }
 end
 
-local selfPos, selfRot, selfOmega, self_velocity = coordinate.getAbsoluteCoordinates(), quat.new(), newVec(), newVec()
-local rednet_parallel = {}
-local generateSendMethod = function(name, id, t_target, g_group)
-    if name == "cbc_missile" then
-        return function()
-            rednet.send(id, {
-                pos = selfPos,
-                rot = selfRot,
-                center_velocity = self_velocity,
-                omega = selfOmega,
-                tgPos = t_target,
-                velocity = t_target.velocity,
-                missile = g_group.fire
-            }, missile_protocol)
-        end
-    else
-        return function()
-            rednet.send(id, {
-                pos = selfPos,
-                rot = selfRot,
-                center_velocity = self_velocity,
-                omega = selfOmega,
-                tgPos = t_target,
-                velocity = t_target.velocity,
-                mode = g_group.mode,
-                fire = g_group.fire
-            }, protocol)
-        end
-    end
-end
-
-local rednet_parallel_insert = function (t)
-    if #rednet_parallel <= #linkedCannons then
-        table.insert(rednet_parallel, t)
-    end
-end
+local selfPos = coordinate and coordinate.getAbsoluteCoordinates() or newVec()
+local selfRot, selfOmega, self_velocity = quat.new(), newVec(), newVec()
 
 scanner = {
     mobs = {},
@@ -408,6 +369,70 @@ scanner = {
     entities = {},
     preEntities = {},
 }
+
+local getMwvsRadar = function()
+    if mwvsRadar then
+        return mwvsRadar
+    end
+    mwvsRadar = peripheral.find("mwvs_radar")
+    return mwvsRadar
+end
+
+local lockMwvsRadarTarget = function(target)
+    if not target then
+        return
+    end
+
+    local shipId = target.shipId or target.id
+    if not shipId or shipId == mwvsLastLockShipId then
+        return
+    end
+
+    local radar = getMwvsRadar()
+    if not radar then
+        return
+    end
+
+    local ok, result = pcall(function()
+        return radar.lock(shipId)
+    end)
+    if ok and result and result.ok ~= false then
+        mwvsLastLockShipId = shipId
+    end
+end
+
+local clearMwvsRadarLock = function()
+    local radar = getMwvsRadar()
+    if not radar then
+        return
+    end
+
+    local ok = pcall(function()
+        radar.clearLock()
+    end)
+    if ok then
+        mwvsLastLockShipId = nil
+    end
+end
+
+local updateSelfFromMwvsRadar = function()
+    local radar = getMwvsRadar()
+    if not radar then
+        return
+    end
+
+    local ok, ownShip = pcall(function()
+        return radar.getOwnShipInfo()
+    end)
+    if ok and ownShip and ownShip.ok ~= false then
+        selfPos = {
+            x = ownShip.x or 0,
+            y = ownShip.y or 0,
+            z = ownShip.z or 0
+        }
+        self_velocity = ownShip.velocity or newVec()
+    end
+end
 
 function scanner:getPlayer(range)
     self.players = coordinate.getPlayers(range)
@@ -480,14 +505,28 @@ function scanner:getMobs(scope)
 end
 
 function scanner:getShips(range)
-    if not coordinate then
-        return
-    end
     local ships
-    if dimension == "overworld" then
-        ships = coordinate.getShips(range)
-    else
-        ships = coordinate.getShipsAll(range)
+    local radar = getMwvsRadar()
+    if radar then
+        local ok, result = pcall(function()
+            return radar.getTargets(range)
+        end)
+        if ok and result then
+            ships = result
+        else
+            mwvsRadar = nil
+        end
+    end
+
+    if not ships then
+        if not coordinate then
+            return
+        end
+        if dimension == "overworld" then
+            ships = coordinate.getShips(range)
+        else
+            ships = coordinate.getShipsAll(range)
+        end
     end
 
     for k, v in pairs(scanner.vsShips) do
@@ -495,22 +534,30 @@ function scanner:getShips(range)
     end
 
     for k, v in pairs(ships) do
-        if scanner.vsShips[v.id] then
-            v.velocity = {
-                x = v.x - scanner.vsShips[v.id].x,
-                y = v.y - scanner.vsShips[v.id].y,
-                z = v.z - scanner.vsShips[v.id].z
-            }
-        else
-            v.velocity = {
-                x = 0,
-                y = 0,
-                z = 0
-            }
+        v.id = v.id or v.shipId
+        v.shipId = v.shipId or v.id
+        v.slug = v.slug or v.name or ("VS2 #" .. tostring(v.id))
+        local key = v.id
+        local radarVelocity = v.velocity
+
+        if key then
+            if scanner.vsShips[key] then
+                v.velocity = {
+                    x = v.x - scanner.vsShips[key].x,
+                    y = v.y - scanner.vsShips[key].y,
+                    z = v.z - scanner.vsShips[key].z
+                }
+            else
+                v.velocity = radarVelocity or {
+                    x = 0,
+                    y = 0,
+                    z = 0
+                }
+            end
+            v.flag = true
+            v.name = v.slug
+            scanner.vsShips[key] = v
         end
-        v.flag = true
-        v.name = v.slug
-        scanner.vsShips[v.id] = v
     end
 
     for k, v in pairs(scanner.vsShips) do
@@ -522,8 +569,6 @@ function scanner:getShips(range)
 end
 
 function scanner:getAllTarget()
-    self:getPlayer(properties.raycastRange)
-    self:getMobs(properties.raycastRange)
     self:getShips(properties.raycastRange)
 end
 
@@ -531,31 +576,16 @@ scanner.run = function()
     while true do
         scanner:getAllTarget()
 
-        for k, v in pairs(tm_monitors.list) do -- 刷新所有处于雷达界面的窗口
+        for k, v in pairs(tm_monitors.list) do -- 鍒锋柊鎵€鏈夊浜庨浄杈剧晫闈㈢殑绐楀彛
             for k2, v2 in pairs(v.windows) do
-                if group[v2.group.index].mode > 2 then
+                if modList[group[v2.group.index].mode] == "SHIP" then
                     v2:refresh()
                     v.gpu.sync()
                 end
             end
         end
 
-        for _, g in pairs(group) do
-            if g.fireCd > 0 then
-                g.fireCd = g.fireCd - 1
-                if g.fireCd == 1 then
-                    g.fire = false
-                end
-            elseif g.fireCd < 1 then
-                if g.autoFire then
-                    g.fire = true
-                    g.fireCd = 20
-                else
-                    g.fire = false
-                end
-            end
-        end
-
+        updateSelfFromMwvsRadar()
         if ship then
             selfPos = ship.getWorldspacePosition()
             selfRot = ship.getQuaternion()
@@ -565,10 +595,7 @@ scanner.run = function()
     
         for k, v in pairs(group) do
             local kk1
-            if v.mode == 3 then kk1 = "vsShips"
-            elseif v.mode == 4 then kk1 = "players"
-            elseif v.mode == 5 then kk1 = "monsters"
-            elseif v.mode == 6 then kk1 = "mobs"
+            if modList[v.mode] == "SHIP" then kk1 = "vsShips"
             end
 
             local kk2 = kk1 == "vsShips" and "slug" or "uuid"
@@ -595,12 +622,7 @@ scanner.run = function()
                 end
 
                 table.sort(v.radarTargets, function(a, b) return a.dis < b.dis end)
-                local len = 0
-                for _, ca in pairs(linkedCannons) do
-                    if ca.group and group[ca.group].name == v.name then
-                        len = len + 1
-                    end
-                end
+                local len = 1
 
                 local range = #properties.maxSelectRange == 0 and 0 or tonumber(properties.maxSelectRange)
                 range = range and range or 450
@@ -615,27 +637,17 @@ scanner.run = function()
 
                 v.radarTargets = newList
                 if #newList ~= 0 then
-                    local index = 1
-                    for _, ca in pairs(linkedCannons) do
-                        if ca.group and group[ca.group].name == v.name then
-                            local iIndex = index % #newList + 1
-                            rednet_parallel_insert(generateSendMethod(ca.name, ca.id, v.radarTargets[iIndex], group[ca.group]))
-                            index = index + 1
-                        end
-                    end
+                    lockMwvsRadarTarget(newList[1])
+                else
+                    clearMwvsRadarLock()
                 end
             else
                 if scanner[kk1] and v.radarTargets[1] then
                     for k2, v2 in pairs(scanner[kk1]) do
                         if v2[kk2] == v.radarTargets[1][kk2] then
                             v.radarTargets[1] = v2
+                            lockMwvsRadarTarget(v2)
                             break
-                        end
-                    end
-                
-                    for _, ca in pairs(linkedCannons) do
-                        if ca.group and group[ca.group].name == v.name then
-                            rednet_parallel_insert(generateSendMethod(ca.name, ca.id, v.radarTargets[1], group[ca.group]))
                         end
                     end
                 end
@@ -799,26 +811,11 @@ function absCoordInputWindow:refresh()
     self.drawW.drawText(46, 88, self.tmpPos.z, 0x000000, 0xFFFFFF)
     self.drawW.drawText(46, 96, "++++++++", 0x666666, 0x000000)
 
-    local fireColor = group[self.group.index].autoFire and 0xFF0000 or 0x444444
-    local autoColor = group[self.group.index].autoFire and 0x50B358 or 0xFF0000
-    self.drawW.line(2, 2, 2, 2, autoColor)
-    self.drawW.rectangle(4, 4, 5, 5, fireColor)
-    self.drawW.line(6, 3, 6, 9, fireColor)
-    self.drawW.line(3, 6, 9, 6, fireColor)
-
     self.drawW.sync()
 end
 
 function absCoordInputWindow:click(x, y, button)
-    if x < 18 and y < 9 then
-        if x <= 4 and y <= 3 then
-            group[self.group.index].autoFire = not group[self.group.index].autoFire
-        end
-        if x < 10 then
-            group[self.group.index].fire = true
-            group[self.group.index].fireCd = 20
-        end
-    elseif x > 36 and x < 94 then
+    if x > 36 and x < 94 then
         local index = math.floor((x - 46) / 6 + 1)
         index = index > 8 and 8 or index < 1 and 1 or index
         if y >= 16 and y < 40 then
@@ -1000,7 +997,7 @@ function absRadarButtons:refreshRadar()
             yDis = yDis < 6 and 6 or yDis > 255 and 255 or yDis
             local yColor = tonumber(string.format("%x%xFF", yDis, yDis), 16)
 
-            local kkey = group[self.group.index].mode == 3 and "slug" or "uuid"
+            local kkey = modList[group[self.group.index].mode] == "SHIP" and "slug" or "uuid"
 
             local contains = false
             local wl = false
@@ -1030,12 +1027,9 @@ function absRadarButtons:refreshRadar()
         end
     end
 
-    local fireColor = group[self.group.index].fire and 0xFF0000 or 0x444444
-    local autoColor = group[self.group.index].autoFire and 0x50B358 or 0xFF0000
-    self.drawW.line(2, 2, 2, 2, autoColor)
-    self.drawW.rectangle(4, 4, 5, 5, fireColor)
-    self.drawW.line(6, 3, 6, 9, fireColor)
-    self.drawW.line(3, 6, 9, 6, fireColor)
+    self.drawW.rectangle(4, 4, 5, 5, 0x444444)
+    self.drawW.line(6, 3, 6, 9, 0x444444)
+    self.drawW.line(3, 6, 9, 6, 0x444444)
     if group[self.group.index].autoSelect then
         self.drawW.drawText(12, 3, "A", 0xFF0000)
     else
@@ -1052,16 +1046,14 @@ end
 function absRadarButtons:RadarClick(x, y, button)
     if y <= 110 then
         if x < 18 and y < 9 then
-            if x <= 4 and y <= 3 then
-                group[self.group.index].autoFire = not group[self.group.index].autoFire
-            end
             if x < 10 then
-                group[self.group.index].fire = true
-                group[self.group.index].fireCd = 20
+                group[self.group.index].radarTargets = {}
+                clearMwvsRadarLock()
             else
                 group[self.group.index].autoSelect = not group[self.group.index].autoSelect
                 if not group[self.group.index].autoSelect then
                     group[self.group.index].radarTargets = {}
+                    clearMwvsRadarLock()
                 end
             end
         else
@@ -1086,15 +1078,19 @@ function absRadarButtons:RadarClick(x, y, button)
                     tmpPos = RotateVectorByQuat(q, tmpPos)
                     local px, py = 64 - tmpPos.x / scale, 56 - tmpPos.z / scale
                     v.clickDis = math.abs(x - px) + math.abs(y - py)
-                    if group[self.group.index].mode > 2 then
+                    if modList[group[self.group.index].mode] == "SHIP" then
                         if v.clickDis < minDis then
                             minDis = v.clickDis
                             target = v
                         end
                     end
                 end
+
+                if not target then
+                    return
+                end
     
-                local kk1 = group[self.group.index].mode == 3 and "slug" or "uuid"
+                local kk1 = modList[group[self.group.index].mode] == "SHIP" and "slug" or "uuid"
 
                 if button == 1 then
                     local val = target[kk1]
@@ -1126,6 +1122,14 @@ function absRadarButtons:RadarClick(x, y, button)
     
                 if group[self.group.index].radarTargets[1] and group[self.group.index].radarTargets[1].clickDis > 5 then
                     group[self.group.index].radarTargets[1] = nil
+                end
+
+                if modList[group[self.group.index].mode] == "SHIP" then
+                    if group[self.group.index].radarTargets[1] then
+                        lockMwvsRadarTarget(group[self.group.index].radarTargets[1])
+                    else
+                        clearMwvsRadarLock()
+                    end
                 end
             end
         end
@@ -1165,7 +1169,7 @@ function absWindow:init()
     self.windows.cannonList = setmetatable({
         list = linkedCannons,
         mode = "switch",
-        name = "  CANNON",
+        name = "  RADAR",
         drawW = self.drawW.createWindow(1, 65, 64, 64),
         group = self.group
     }, {
@@ -1244,20 +1248,8 @@ function absWindow:click(x, y, button)
         if y <= 8 then
             self.windows.modeSwitch:click(x - 64, y, button)
         else
-            if modList[group[self.group.index].mode] == "POINT" then
-                self.windows.pointInput:click(x - 64, y - 8, button)
-            elseif modList[group[self.group.index].mode] == "HMS" then
-                self.windows.hmsWindow:click(x - 64, y - 8, button)
-            elseif modList[group[self.group.index].mode] == "SHIP" then
+            if modList[group[self.group.index].mode] == "SHIP" then
                 self.windows.shipRadar:click(x - 64, y - 8, button)
-            elseif modList[group[self.group.index].mode] == "ANTIAIRCRAFT" then
-                self.windows.antiairRadar:click(x - 64, y - 8, button)
-            elseif modList[group[self.group.index].mode] == "PLAYER" then
-                self.windows.playerRadar:click(x - 64, y - 8, button)
-            elseif modList[group[self.group.index].mode] == "MONSTER" then
-                self.windows.monsterRadar:click(x - 64, y - 8, button)
-            elseif modList[group[self.group.index].mode] == "MOBS" then
-                self.windows.MobsRadar:click(x - 64, y - 8, button)
             end
         end
     end
@@ -1267,20 +1259,8 @@ function absWindow:refresh()
     self.windows.groupList:refresh()
     self.windows.cannonList:refresh()
     self.windows.modeSwitch:refresh()
-    if modList[group[self.group.index].mode] == "POINT" then
-        self.windows.pointInput:refresh()
-    elseif modList[group[self.group.index].mode] == "HMS" then
-        self.windows.hmsWindow:refresh()
-    elseif modList[group[self.group.index].mode] == "SHIP" then
+    if modList[group[self.group.index].mode] == "SHIP" then
         self.windows.shipRadar:refresh()
-    elseif modList[group[self.group.index].mode] == "ANTIAIRCRAFT" then
-        self.windows.antiairRadar:refresh()
-    elseif modList[group[self.group.index].mode] == "PLAYER" then
-        self.windows.playerRadar:refresh()
-    elseif modList[group[self.group.index].mode] == "MONSTER" then
-        self.windows.monsterRadar:refresh()
-    elseif modList[group[self.group.index].mode] == "MOBS" then
-        self.windows.MobsRadar:refresh()
     end
     self.drawW.sync()
 end
@@ -1369,117 +1349,6 @@ end
 function tm_monitors:refresh()
     for k, v in pairs(self.list) do
         v:refresh()
-    end
-end
-
-local emptyTb = {}
-local getGoggles = function()
-    while true do
-        local dis = properties.raycastRange
-
-        if goggle_link_port then
-            local connect = goggle_link_port.getConnected()
-
-            for k, v in pairs(connect) do
-                local infos = v.getInfo()
-                if infos.is_player then
-                    v.info = infos
-                    v.name = infos.nickname
-                    linkedgoggles[k] = v
-                else
-                    linkedgoggles[k] = nil
-                end
-            end
-
-        else
-            linkedgoggles = emptyTb
-        end
-
-        local flag = false
-        for k, v in pairs(group) do -- 如果没有组在头瞄模式，不开启raycast
-            if modList[v.mode] == "HMS" then
-                flag = true
-                break
-            end
-        end
-
-        if flag then
-            for k, v in pairs(scanner.players) do
-                for _, ca in pairs(linkedCannons) do
-                    if ca.group then
-                        if group[ca.group].mode == 1 and group[ca.group].HmsMode == 1 and group[ca.group].HmsUser ==
-                            v.name then
-                            if not v.targetPos then
-                                v.y = v.y + 1.75
-                                v.targetPos = rayCaster.run(v, {
-                                    x = v.viewVector.x,
-                                    y = v.viewVector.y,
-                                    z = v.viewVector.z
-                                }, dis, false)
-                            end
-
-                            local t_tg = v.targetPos
-                            t_tg.velocity = newVec()
-                            rednet_parallel_insert(generateSendMethod(ca.name, ca.id, t_tg, {mode = 1, fire = group[ca.group].fire}))
-                        end
-                    end
-                end
-                v.targetPos = nil
-            end
-        end
-
-        if flag then
-            local index = 0
-            for k, v in pairs(linkedgoggles) do
-                local flag3 = false
-                for k2, v2 in pairs(group) do
-                    if v2.HmsUser == v.name then -- 只有选择头瞄了玩家，才开启raycast
-                        flag3 = true
-                        break
-                    end
-                end
-
-                if flag3 then
-                    index = index + 1
-                    local target = v.raycast(dis)
-                    local hitpos = target.hit_pos
-                    v.targetPos = {
-                        x = 0,
-                        y = 0,
-                        z = 0
-                    }
-                    if hitpos then
-                        v.targetPos.x = hitpos[1]
-                        v.targetPos.y = hitpos[2]
-                        v.targetPos.z = hitpos[3]
-                    else
-                        local infos = v.getInfo()
-                        local xRot = math.rad(infos.xRot)
-                        local yRot = math.rad(infos.yHeadRot)
-                        local cosH = math.cos(xRot)
-                        v.targetPos.x = infos.eye_pos[1] - dis * math.sin(yRot) * cosH
-                        v.targetPos.z = infos.eye_pos[3] + dis * math.cos(yRot) * cosH
-                        v.targetPos.y = infos.eye_pos[2] - dis * math.sin(xRot)
-                    end
-
-                    for _, ca in pairs(linkedCannons) do
-                        if ca.group then
-                            if group[ca.group].mode == 1 and group[ca.group].HmsMode == 2 and group[ca.group].HmsUser ==
-                                v.name then
-                                local t_tg = {x = v.targetPos.x, y = v.targetPos.y, z = v.targetPos.z, velocity = newVec()}
-                                rednet_parallel_insert(generateSendMethod(ca.name, ca.id, t_tg, {mode = 1, fire = group[ca.group].fire}))
-                            end
-                        end
-                    end
-                end
-            end
-
-            if index == 0 then
-                sleep(0.1)
-            end
-        else
-            sleep(0.05)
-        end
     end
 end
 
@@ -1698,96 +1567,6 @@ function termUtil:refresh()
     end
 end
 
-peripheral.find("modem", rednet.open)
--- {name = properties.cannonName, pw = properties.password}
-local redNet = function()
-    while true do
-        local id, msg
-        repeat
-            id, msg = rednet.receive(request_protocol)
-        until type(msg) == "table"
-        if msg.pw == properties.password then
-            local flag = false
-            for k, v in pairs(linkedCannons) do
-                if v.id == id then
-                    v.beat = 3
-                    v.name = msg.name
-                    flag = true
-                    break
-                end
-            end
-
-            if not flag then
-                table.insert(linkedCannons, {
-                    id = id,
-                    name = msg.name,
-                    beat = 3,
-                    mode = 2,
-                    group = nil
-                })
-
-                if not table.contains(properties.whiteList, msg.slug) then
-                    table.insert(properties.whiteList, msg.slug)
-                end
-                
-                if not table.contains(properties.whiteList, msg.yawSlug) then
-                    table.insert(properties.whiteList, msg.yawSlug)
-                end
-
-                if msg.pitchSlug and not table.contains(properties.whiteList, msg.pitchSlug) then
-                    table.insert(properties.whiteList, msg.pitchSlug)
-                end
-            end
-
-            for k, v in pairs(tm_monitors.list) do
-                for k2, v2 in pairs(v.windows) do
-                    v2.windows.cannonList:refresh()
-                    v2.drawW.sync()
-                end
-                v.gpu.sync()
-            end
-            for _, ca in pairs(linkedCannons) do -- 如果是point模式顺便发送坐标
-                if ca.group then
-                    if group[ca.group].mode == 2 then
-                        local t_tg = group[ca.group].pos
-                        t_tg.velocity = newVec()
-                        rednet_parallel_insert(generateSendMethod(ca.name, ca.id, t_tg, {mode = 2, fire = group[ca.group].fire}))
-                    end
-                end
-            end
-        end
-    end
-end
-
-local beats = function()
-    while true do
-        local index = 1
-        while true do
-            if index > #linkedCannons then
-                break
-            end
-            linkedCannons[index].beat = linkedCannons[index].beat - 1
-            if linkedCannons[index].beat < 0 then
-                table.remove(linkedCannons, index)
-                index = index - 1
-            end
-            index = index + 1
-        end
-        sleep(1)
-    end
-end
-
-local sender = function()
-    while true do
-        if #rednet_parallel > 0 then
-            --commands.execAsync(("say %d"):format(#rednet_parallel))
-            parallel.waitForAll(unpack(rednet_parallel))
-            rednet_parallel = {}
-        end
-        sleep(0.05)
-    end
-end
-
 local events = function()
     while true do
         local eventData = {os.pullEvent()}
@@ -1797,13 +1576,12 @@ local events = function()
             if event == "mouse_click" then
                 term.setCursorBlink(true)
                 local x, y = eventData[3], eventData[4]
-                for k, v in pairs(termUtil.fieldTb) do -- 点击了输入框
+                for k, v in pairs(termUtil.fieldTb) do -- 鐐瑰嚮浜嗚緭鍏ユ
                     if y == v.y and x >= v.x and x <= v.x + v.len then
                         v:click(x, y)
                     end
                 end
-                for k, v in pairs(termUtil.selectBoxTb) do -- 点击了选择框
-                    if y == v.y then
+                for k, v in pairs(termUtil.selectBoxTb) do -- 鐐瑰嚮浜嗛€夋嫨妗?                    if y == v.y then
                         v:click(x, y)
                     end
                 end
@@ -1823,7 +1601,7 @@ local events = function()
                 end
             end
 
-            -- 刷新数据到properties
+            -- 鍒锋柊鏁版嵁鍒皃roperties
             system.updatePersistentData()
             termUtil:refresh()
 
@@ -1850,7 +1628,7 @@ tm_monitors:init()
 termUtil:init()
 
 local run = function()
-    parallel.waitForAll(redNet, beats, getGoggles, scanner.run, events, sender)
+    parallel.waitForAll(scanner.run, events)
 end
 
 run()
